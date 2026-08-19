@@ -1,0 +1,5 @@
+impl/
+*.fs
+*.tmp
+*.log
+.DS_Store

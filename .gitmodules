@@ -1,0 +1,3 @@
+[submodule "cores/jt51"]
+	path = cores/jt51
+	url = https://github.com/jotego/jt51.git
