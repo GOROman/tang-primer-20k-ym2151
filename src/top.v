@@ -4,6 +4,8 @@ module top (
     input  wire vol_down_n,
     input  wire vol_up_n,
     input  wire wav_trig_n,
+    input  wire uart_rx_i,
+    output wire uart_txp,
     output wire HP_BCK,
     output wire HP_WS,
     output wire HP_DIN,
@@ -11,6 +13,12 @@ module top (
     output reg [3:0] led,
     output wire O_tmds_clk_p, output wire O_tmds_clk_n,
     output wire [2:0] O_tmds_data_p, output wire [2:0] O_tmds_data_n
+    ,output wire [13:0] ddr_addr, output wire [2:0] ddr_bank,
+    output wire ddr_cs, output wire ddr_ras, output wire ddr_cas,
+    output wire ddr_we, output wire ddr_ck, output wire ddr_ck_n,
+    output wire ddr_cke, output wire ddr_odt, output wire ddr_reset_n,
+    output wire [1:0] ddr_dm, inout wire [15:0] ddr_dq,
+    inout wire [1:0] ddr_dqs, inout wire [1:0] ddr_dqs_n
 );
     wire rst = ~rst_n;
 
@@ -31,20 +39,67 @@ module top (
 
     reg song_enable;
     reg [24:0] song_delay;
-    wire startup_done;
+    reg auto_start_pending;
+    reg restart_pending;
+    wire uart_command_valid;
+    wire [7:0] uart_command_data;
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             song_enable <= 1'b0;
             song_delay <= 25'd0;
-        end else if (!song_enable && startup_done) begin
-            if (song_delay == 25'd26_999_999)
+            auto_start_pending <= 1'b1;
+            restart_pending <= 1'b0;
+        end else if (uart_command_valid &&
+                     (uart_command_data == "S" || uart_command_data == "s")) begin
+            song_enable <= 1'b0;
+            auto_start_pending <= 1'b0;
+            restart_pending <= 1'b0;
+        end else if (uart_command_valid && ddr_loaded &&
+                    (uart_command_data == "P" || uart_command_data == "p" ||
+                     uart_command_data == "R" || uart_command_data == "r")) begin
+            // Hold reset for one clock so the stream, decoder and JT51 all
+            // return to byte zero before playback is released again.
+            song_enable <= 1'b0;
+            auto_start_pending <= 1'b0;
+            restart_pending <= 1'b1;
+        end else if (restart_pending) begin
+            song_enable <= 1'b1;
+            restart_pending <= 1'b0;
+        end else if (auto_start_pending && !song_enable && ddr_loaded) begin
+            if (song_delay == 25'd26_999_999) begin
                 song_enable <= 1'b1;
-            else
+                auto_start_pending <= 1'b0;
+            end else begin
                 song_delay <= song_delay + 1'b1;
+            end
         end
     end
 
-    wire core_rst = rst | ~song_enable;
+    // Hold the music core while the two-second direct-DAC diagnostic scale
+    // plays, then start the YM2151 stream from its first byte.
+    reg [25:0] dac_test_hold_count;
+    reg dac_test_hold;
+    reg dac_test_completed;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            dac_test_hold_count <= 26'd0;
+            dac_test_hold <= 1'b1;
+            dac_test_completed <= 1'b0;
+        end else if (!song_enable && !dac_test_completed) begin
+            dac_test_hold_count <= 26'd0;
+            dac_test_hold <= 1'b1;
+        end else if (dac_test_hold) begin
+            if (dac_test_hold_count == 26'd59_399_999) begin
+                dac_test_hold <= 1'b0;
+                dac_test_completed <= 1'b1;
+            end else
+                dac_test_hold_count <= dac_test_hold_count + 1'b1;
+        end else if (dac_test_completed) begin
+            dac_test_hold <= 1'b0;
+        end
+    end
+
+    wire core_rst = rst | ~song_enable | dac_test_hold;
 
     // S2/S3 volume control in 5% steps, limited to 5%..25%.
     // The Dock amplifier is already loud, so keep both JT51 and the stored
@@ -109,22 +164,65 @@ module top (
     end
 
     wire [7:0] rom_data;
-    wire [15:0] rom_addr;
+    wire [16:0] rom_addr;
+    wire rom_req_toggle;
+    wire rom_done_toggle;
+    wire ddr_loaded;
+    wire [3:0] ddr_crc_kind;
     wire stream_valid;
     wire [7:0] stream_data;
     wire stream_ready;
     wire stream_done;
+    reg rom_req_seen;
+    reg rom_done_seen_debug;
+    reg rom_req_prev_debug;
+    reg rom_done_prev_debug;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            rom_req_seen <= 1'b0;
+            rom_done_seen_debug <= 1'b0;
+            rom_req_prev_debug <= 1'b0;
+            rom_done_prev_debug <= 1'b0;
+        end else begin
+            rom_req_prev_debug <= rom_req_toggle;
+            rom_done_prev_debug <= rom_done_toggle;
+            if (rom_req_toggle != rom_req_prev_debug)
+                rom_req_seen <= 1'b1;
+            if (rom_done_toggle != rom_done_prev_debug)
+                rom_done_seen_debug <= 1'b1;
+        end
+    end
 
-    song_rom u_song_rom(.clk(clk), .addr(rom_addr), .data(rom_data));
+    ddr_song_rom u_song_rom(
+        .clk(clk), .rst_n(rst_n), .uart_rx_i(uart_rx_i),
+        .addr(rom_addr), .req_toggle(rom_req_toggle),
+        .data(rom_data), .done_toggle(rom_done_toggle), .loaded(ddr_loaded),
+        .crc_kind(ddr_crc_kind),
+        .command_valid(uart_command_valid), .command_data(uart_command_data),
+        .ddr_addr(ddr_addr), .ddr_bank(ddr_bank), .ddr_cs(ddr_cs),
+        .ddr_ras(ddr_ras), .ddr_cas(ddr_cas), .ddr_we(ddr_we),
+        .ddr_ck(ddr_ck), .ddr_ck_n(ddr_ck_n), .ddr_cke(ddr_cke),
+        .ddr_odt(ddr_odt), .ddr_reset_n(ddr_reset_n), .ddr_dm(ddr_dm),
+        .ddr_dq(ddr_dq), .ddr_dqs(ddr_dqs), .ddr_dqs_n(ddr_dqs_n),
+        .uart_txp(uart_txp));
     lzss_stream u_stream(
         .clk(clk), .rst(core_rst), .out_ready(stream_ready),
         .out_valid(stream_valid), .out_data(stream_data), .done(stream_done),
-        .rom_addr(rom_addr), .rom_data(rom_data)
+        .rom_addr(rom_addr), .rom_req_toggle(rom_req_toggle),
+        .rom_done_toggle(rom_done_toggle), .rom_data(rom_data)
     );
 
     wire jt_cs_n, jt_wr_n, jt_a0;
     wire [7:0] jt_din;
     wire playing;
+    reg opm_write_seen;
+    always @(posedge clk or posedge rst) begin
+        if (rst)
+            opm_write_seen <= 1'b0;
+        else if (!jt_cs_n && !jt_wr_n && jt_a0)
+            opm_write_seen <= 1'b1;
+    end
+
     nlg_player u_player(
         .clk(clk), .rst(core_rst), .opm_cen(opm_cen),
         .stream_valid(stream_valid), .stream_data(stream_data),
@@ -138,11 +236,13 @@ module top (
     wire signed [15:0] right;
     wire signed [15:0] xleft;
     wire signed [15:0] xright;
-    // Keep the YM2151-compatible left/right outputs separate for the
-    // Dock's stereo PT8211 DAC.  Widen both operands before multiplying so
-    // the volume product cannot be truncated by Verilog expression sizing.
-    // PT8211 is a linear 16-bit DAC, so use JT51's full-resolution outputs.
-    // left/right model the lower-resolution YM3012-compatible conversion.
+    jt51 u_jt51(
+        .rst(core_rst), .clk(clk), .cen(opm_cen), .cen_p1(opm_cen_p1),
+        .cs_n(jt_cs_n), .wr_n(jt_wr_n), .a0(jt_a0), .din(jt_din),
+        .dout(jt_dout), .ct1(), .ct2(), .irq_n(), .sample(sample),
+        .left(left), .right(right), .xleft(xleft), .xright(xright)
+    );
+
     wire signed [22:0] left_wide = {{7{xleft[15]}}, xleft};
     wire signed [22:0] right_wide = {{7{xright[15]}}, xright};
     wire signed [22:0] volume_wide = {18'd0, volume};
@@ -164,6 +264,10 @@ module top (
             pcm_left <= 16'sd0;
             pcm_right <= 16'sd0;
             pcm_toggle <= 1'b0;
+        end else if (stream_done) begin
+            pcm_left <= 16'sd0;
+            pcm_right <= 16'sd0;
+            pcm_toggle <= ~pcm_toggle;
         end else if (sample) begin
             pcm_toggle <= ~pcm_toggle;
             if (scaled_left > 23'sd32767)
@@ -182,26 +286,23 @@ module top (
         end
     end
 
-    jt51 u_jt51(
-        .rst(core_rst), .clk(clk), .cen(opm_cen), .cen_p1(opm_cen_p1),
-        .cs_n(jt_cs_n), .wr_n(jt_wr_n), .a0(jt_a0), .din(jt_din),
-        .dout(jt_dout), .ct1(), .ct2(), .irq_n(),
-        .sample(sample), .left(left), .right(right),
-        .xleft(xleft), .xright(xright)
-    );
-
     // Primer 20K Dock onboard PT8211 stereo DAC.
     // The PLL produces 48 MHz and its dedicated /24 output produces a
     // 2 MHz BCK, giving a 62.5 kHz stereo frame rate.
     // This matches JT51 at a 4 MHz OPM clock (4 MHz / 64).
     wire clk_48m;
     wire clk_2m;
+    wire audio_pll_lock;
     wire dac_req;
-    assign PA_EN = audio_ready;
+    // Once playback has been released, keep the Dock amplifier enabled even
+    // if the startup-delay flag failed to cross its terminal count.
+    wire amp_enable = audio_ready | song_enable;
+    assign PA_EN = amp_enable;
 
     Gowin_rPLL u_audio_pll(
         .clkout(clk_48m),
         .clkoutd(clk_2m),
+        .lock(audio_pll_lock),
         .reset(rst),
         .clkin(clk)
     );
@@ -232,40 +333,6 @@ module top (
         end
     end
 
-    // One pulse after each complete right/left PT8211 frame.
-    reg dac_req_slot;
-    always @(posedge clk_2m or negedge rst_n) begin
-        if (!rst_n)
-            dac_req_slot <= 1'b0;
-        else if (dac_req)
-            dac_req_slot <= ~dac_req_slot;
-    end
-    wire dac_frame_tick = dac_req && dac_req_slot;
-
-    wire [14:0] aux_read_addr;
-    wire aux_read_req_toggle;
-
-    wire signed [15:0] adpcm_left;
-    wire signed [15:0] adpcm_right;
-    wire s4_playing;
-    msm6258_player u_adpcm(
-        .clk(clk_2m),
-        .rst_n(rst_n),
-        .enable(audio_ready),
-        .song_enable(song_enable),
-        .s4_n(wav_trig_n),
-        .frame_tick(dac_frame_tick),
-        .master_volume(volume),
-        .aux_read_data(8'd0),
-        .aux_read_done_toggle(aux_read_req_toggle),
-        .aux_read_addr(aux_read_addr),
-        .aux_read_req_toggle(aux_read_req_toggle),
-        .startup_done(startup_done),
-        .s4_playing(s4_playing),
-        .pcm_left(adpcm_left),
-        .pcm_right(adpcm_right)
-    );
-
     hdmi_opm_debug u_hdmi_debug(
         .clk27(clk), .rst_n(rst_n),
         .opm_cs_n(jt_cs_n), .opm_wr_n(jt_wr_n), .opm_a0(jt_a0),
@@ -273,33 +340,17 @@ module top (
         .tmds_clk_p(O_tmds_clk_p), .tmds_clk_n(O_tmds_clk_n),
         .tmds_data_p(O_tmds_data_p), .tmds_data_n(O_tmds_data_n));
 
-    reg signed [16:0] mixed_left_wide;
-    reg signed [16:0] mixed_right_wide;
-    reg signed [15:0] song_left;
-    reg signed [15:0] song_right;
-    always @(*) begin
-        mixed_left_wide = {jt_dac_left[15], jt_dac_left} +
-                          {adpcm_left[15], adpcm_left};
-        mixed_right_wide = {jt_dac_right[15], jt_dac_right} +
-                           {adpcm_right[15], adpcm_right};
-        if (mixed_left_wide > 17'sd32767)
-            song_left = 16'sd32767;
-        else if (mixed_left_wide < -17'sd32768)
-            song_left = -16'sd32768;
-        else
-            song_left = mixed_left_wide[15:0];
-        if (mixed_right_wide > 17'sd32767)
-            song_right = 16'sd32767;
-        else if (mixed_right_wide < -17'sd32768)
-            song_right = -16'sd32768;
-        else
-            song_right = mixed_right_wide[15:0];
-    end
+    wire dac_test_active;
+    wire signed [15:0] dac_test_left;
+    wire signed [15:0] dac_test_right;
+    dac_scale_test u_dac_scale_test(
+        .clk(clk_2m), .rst_n(rst_n), .enable(song_enable), .req(dac_req),
+        .active(dac_test_active), .pcm_left(dac_test_left),
+        .pcm_right(dac_test_right)
+    );
 
-    // S4 owns the single X68000 ADPCM channel while the voice is active.
-    // Keep the MDX timeline running, but output only the S4 sample.
-    wire signed [15:0] dac_left = s4_playing ? adpcm_left : song_left;
-    wire signed [15:0] dac_right = s4_playing ? adpcm_right : song_right;
+    wire signed [15:0] dac_left = dac_test_active ? dac_test_left : jt_dac_left;
+    wire signed [15:0] dac_right = dac_test_active ? dac_test_right : jt_dac_right;
 
     pt8211_stereo_drive u_pt8211(
         .clk_1p536m(clk_2m),
@@ -312,8 +363,31 @@ module top (
         .HP_DIN(HP_DIN)
     );
 
-    // Status: song, S4 voice, audio enabled, configured.
+    // A CRC failure is a hard stop.  Blink all four LEDs quickly so it is
+    // distinguishable from the normal one-LED CRC-passed indication.
+    reg [21:0] error_blink_counter;
+    reg error_blink_phase;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            error_blink_counter <= 22'd0;
+            error_blink_phase <= 1'b0;
+        end else if (ddr_crc_kind == 4'b1111) begin
+            if (error_blink_counter == 22'd2_699_999) begin
+                error_blink_counter <= 22'd0;
+                error_blink_phase <= ~error_blink_phase;
+            end else begin
+                error_blink_counter <= error_blink_counter + 1'b1;
+            end
+        end else begin
+            error_blink_counter <= 22'd0;
+            error_blink_phase <= 1'b0;
+        end
+    end
+
     always @(*) begin
-        led = {song_enable, s4_playing, audio_ready, 1'b1};
+        if (ddr_crc_kind == 4'b1111)
+            led = error_blink_phase ? 4'b1111 : 4'b0000;
+        else
+            led = ddr_crc_kind;
     end
 endmodule

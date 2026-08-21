@@ -5,8 +5,10 @@ module lzss_stream (
     output reg        out_valid,
     output reg [7:0]  out_data,
     output reg        done,
-    output reg [15:0] rom_addr,
-    input  wire [7:0] rom_data
+    output reg [16:0] rom_addr,
+    output reg        rom_req_toggle,
+    input  wire        rom_done_toggle,
+    input  wire [7:0]  rom_data
 );
     `include "song_meta.vh"
 
@@ -30,7 +32,8 @@ module lzss_stream (
     reg [7:0] match_lo;
     reg [11:0] match_dist;
     reg [4:0] match_left;
-    reg [18:0] raw_count;
+    reg [19:0] raw_count;
+    reg rom_done_seen;
 
     reg [7:0] window [0:4095];
     reg [11:0] win_pos;
@@ -54,14 +57,16 @@ module lzss_stream (
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             state       <= S_CTRL_REQ;
-            rom_addr    <= 16'd0;
+            rom_addr    <= 17'd0;
+            rom_req_toggle <= 1'b0;
+            rom_done_seen <= 1'b0;
             control     <= 8'd0;
             token_count <= 4'd0;
             out_valid   <= 1'b0;
             out_data    <= 8'd0;
             done        <= 1'b0;
             win_pos     <= 12'd0;
-            raw_count   <= 19'd0;
+            raw_count   <= 20'd0;
             match_left  <= 5'd0;
         end else if (!done) begin
             case (state)
@@ -69,14 +74,18 @@ module lzss_stream (
                     if (raw_count >= SONG_RAW_BYTES) begin
                         done <= 1'b1;
                     end else begin
+                        rom_req_toggle <= ~rom_req_toggle;
                         state <= S_CTRL_WAIT;
                     end
                 end
                 S_CTRL_WAIT: begin
-                    control <= rom_data;
-                    token_count <= 4'd8;
-                    rom_addr <= rom_addr + 1'b1;
-                    state <= S_TOKEN;
+                    if (rom_done_toggle != rom_done_seen) begin
+                        rom_done_seen <= rom_done_toggle;
+                        control <= rom_data;
+                        token_count <= 4'd8;
+                        rom_addr <= rom_addr + 1'b1;
+                        state <= S_TOKEN;
+                    end
                 end
                 S_TOKEN: begin
                     if (raw_count >= SONG_RAW_BYTES) begin
@@ -89,25 +98,43 @@ module lzss_stream (
                         state <= S_M1_REQ;
                     end
                 end
-                S_LIT_REQ: state <= S_LIT_WAIT;
+                S_LIT_REQ: begin
+                    rom_req_toggle <= ~rom_req_toggle;
+                    state <= S_LIT_WAIT;
+                end
                 S_LIT_WAIT: begin
-                    out_data <= rom_data;
-                    out_valid <= 1'b1;
-                    rom_addr <= rom_addr + 1'b1;
-                    state <= S_HOLD;
+                    if (rom_done_toggle != rom_done_seen) begin
+                        rom_done_seen <= rom_done_toggle;
+                        out_data <= rom_data;
+                        out_valid <= 1'b1;
+                        rom_addr <= rom_addr + 1'b1;
+                        state <= S_HOLD;
+                    end
                 end
-                S_M1_REQ: state <= S_M1_WAIT;
+                S_M1_REQ: begin
+                    rom_req_toggle <= ~rom_req_toggle;
+                    state <= S_M1_WAIT;
+                end
                 S_M1_WAIT: begin
-                    match_lo <= rom_data;
-                    rom_addr <= rom_addr + 1'b1;
-                    state <= S_M2_REQ;
+                    if (rom_done_toggle != rom_done_seen) begin
+                        rom_done_seen <= rom_done_toggle;
+                        match_lo <= rom_data;
+                        rom_addr <= rom_addr + 1'b1;
+                        state <= S_M2_REQ;
+                    end
                 end
-                S_M2_REQ: state <= S_M2_WAIT;
+                S_M2_REQ: begin
+                    rom_req_toggle <= ~rom_req_toggle;
+                    state <= S_M2_WAIT;
+                end
                 S_M2_WAIT: begin
-                    match_dist <= {rom_data[7:4], match_lo} + 1'b1;
-                    match_left <= {1'b0, rom_data[3:0]} + 5'd3;
-                    rom_addr <= rom_addr + 1'b1;
-                    state <= S_MATCH_REQ;
+                    if (rom_done_toggle != rom_done_seen) begin
+                        rom_done_seen <= rom_done_toggle;
+                        match_dist <= {rom_data[7:4], match_lo} + 1'b1;
+                        match_left <= {1'b0, rom_data[3:0]} + 5'd3;
+                        rom_addr <= rom_addr + 1'b1;
+                        state <= S_MATCH_REQ;
+                    end
                 end
                 S_MATCH_REQ: begin
                     win_rd_addr <= win_pos - match_dist;

@@ -6,14 +6,14 @@
 //Device: GW2A-18
 //Created Time: Wed Aug 24 20:10:53 2022
 
-module Gowin_rPLL (clkout, clkoutd, reset, clkin);
+module Gowin_rPLL (clkout, clkoutd, lock, reset, clkin);
 
 output clkout;
 output clkoutd;
+output lock;
 input reset;
 input clkin;
 
-wire lock_o;
 wire clkoutp_o;
 wire clkoutd3_o;
 wire gw_gnd;
@@ -22,7 +22,7 @@ assign gw_gnd = 1'b0;
 
 rPLL rpll_inst (
     .CLKOUT(clkout),
-    .LOCK(lock_o),
+    .LOCK(lock),
     .CLKOUTP(clkoutp_o),
     .CLKOUTD(clkoutd),
     .CLKOUTD3(clkoutd3_o),
@@ -59,6 +59,6 @@ defparam rpll_inst.CLKOUTD_BYPASS = "false";
 defparam rpll_inst.DYN_SDIV_SEL = 24;
 defparam rpll_inst.CLKOUTD_SRC = "CLKOUT";
 defparam rpll_inst.CLKOUTD3_SRC = "CLKOUT";
-defparam rpll_inst.DEVICE = "GW2A-18";
+defparam rpll_inst.DEVICE = "GW2A-18C";
 
 endmodule //Gowin_rPLL
